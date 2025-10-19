@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+body { @apply bg-gray-50 text-gray-900; }
+.card { @apply bg-white rounded-2xl shadow p-6 mb-4; }
+.btn { @apply inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-gray-300 hover:bg-gray-100; }
+.input { @apply border border-gray-300 rounded-xl p-2; }
+.grid-auto { @apply grid gap-4; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.badge { @apply text-xs bg-gray-100 rounded px-2 py-0.5; }

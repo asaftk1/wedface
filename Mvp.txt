@@ -1,0 +1,388 @@
+Below is a **safe, incremental patch** to evolve your skeleton into an album‑scoped MVP with guest links, in‑memory selfie search, and basic indexing progress. Apply in order. All paths are relative to `face-finder-skeleton/face-finder-skeleton/backend/app/` unless stated.
+
+---
+
+# 0) Overview (what this patch adds)
+
+* **Album isolation**: each album has its own folder, embeddings, and meta.
+* **Guest search flow**: guest uploads selfie → server computes a **temporary** user vector in memory (selfie not saved) → returns matches **from that album** only.
+* **Index progress**: simple progress endpoint you can poll from the frontend.
+* **(Optional) Resize-on-index**: faster indexing by resizing large images (configurable).
+
+---
+
+# 1) New file: `albums_service.py`
+
+Create `backend/app/albums_service.py`:
+
+```python
+from __future__ import annotations
+import os, io, json, zipfile
+from pathlib import Path
+from typing import List, Dict
+import numpy as np
+import cv2
+
+from .config import get_settings
+from .face_service import build_insightface, image_paths_in_dir, detect_and_embed_faces
+
+# Base data dir: data/albums/<album_id>/{album, embeddings.npy, meta.json, results.json}
+DATA_DIR = os.environ.get("FF_DATA_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data")))
+ALBUMS_BASE = Path(DATA_DIR) / "albums"
+ALBUMS_BASE.mkdir(parents=True, exist_ok=True)
+
+# in-memory progress store (naive)
+_index_progress: Dict[str, Dict[str, int]] = {}
+
+def _paths(album_id: str) -> Dict[str, Path]:
+    root = ALBUMS_BASE / album_id
+    return {
+        "root": root,
+        "album": root / "album",
+        "emb": root / "embeddings.npy",
+        "meta": root / "meta.json",
+        "results": root / "results.json",
+    }
+
+# ---------- Upload ZIP ----------
+
+def extract_zip_to_album(album_id: str, file_like) -> Dict:
+    p = _paths(album_id)
+    p["album"].mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(file_like.read())) as zf:
+        for zi in zf.infolist():
+            if zi.is_dir():
+                continue
+            # keep relative structure but prevent path traversal
+            rel = Path(zi.filename).as_posix()
+            if rel.startswith("../") or rel.startswith("./../"):
+                continue
+            if not rel.lower().endswith((".jpg",".jpeg",".png",".bmp",".webp")):
+                continue
+            out = p["album"] / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(zi) as src, open(out, "wb") as dst:
+                dst.write(src.read())
+    return {"album_id": album_id, "status": "ok"}
+
+# ---------- Indexing ----------
+
+def index_album_images(album_id: str, overwrite: bool = True, resize_max: int = 2000) -> Dict:
+    p = _paths(album_id)
+    album_dir = p["album"]
+    if not album_dir.exists():
+        return {"album_id": album_id, "count": 0, "error": "album not uploaded"}
+
+    imgs = image_paths_in_dir(album_dir)
+    if overwrite:
+        if p["emb"].exists(): p["emb"].unlink()
+        if p["meta"].exists(): p["meta"].unlink()
+
+    all_embs: List[np.ndarray] = []
+    meta: List[Dict] = []
+
+    app = build_insightface()  # shared FaceAnalysis instance
+
+    total = len(imgs)
+    processed = 0
+    _index_progress[album_id] = {"processed": 0, "total": total}
+
+    for img_path in imgs:
+        # read & optional resize
+        img = cv2.imdecode(np.fromfile(str(img_path), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            processed += 1; _index_progress[album_id]["processed"] = processed
+            continue
+        h, w = img.shape[:2]
+        if resize_max and max(h, w) > resize_max:
+            scale = resize_max / float(max(h, w))
+            img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+
+        boxes, embs = detect_and_embed_faces(app, img)
+        for bi, emb in zip(boxes, embs):
+            all_embs.append(emb)
+            meta.append({
+                "rel_path": str(img_path.relative_to(album_dir)),
+                "box": [float(x) for x in bi],
+            })
+        processed += 1
+        _index_progress[album_id]["processed"] = processed
+
+    if all_embs:
+        em = np.vstack(all_embs).astype(np.float32)
+        np.save(p["emb"], em)
+        with open(p["meta"], "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+        return {"album_id": album_id, "count": int(em.shape[0])}
+    else:
+        # write empty files for consistency
+        np.save(p["emb"], np.zeros((0,512), dtype=np.float32))
+        with open(p["meta"], "w", encoding="utf-8") as f:
+            json.dump([], f)
+        return {"album_id": album_id, "count": 0}
+
+
+def index_progress(album_id: str) -> Dict:
+    st = _index_progress.get(album_id, {"processed": 0, "total": 0})
+    # percent as int 0..100 (avoid div by zero)
+    total = st.get("total", 0) or 0
+    processed = st.get("processed", 0) or 0
+    pct = int(round((processed / total) * 100)) if total else 0
+    return {"album_id": album_id, "processed": processed, "total": total, "percent": pct}
+
+# ---------- Guest search (selfie in-memory) ----------
+
+def search_in_album(album_id: str, selfie_files: List[bytes], threshold: float, top_k: int) -> Dict:
+    p = _paths(album_id)
+    emb_p = p["emb"]; meta_p = p["meta"]
+    if not emb_p.exists() or not meta_p.exists():
+        return {"album_id": album_id, "results": [], "error": "album not indexed"}
+
+    embs = np.load(emb_p)
+    with open(meta_p, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if embs.size == 0:
+        return {"album_id": album_id, "results": []}
+
+    app = build_insightface()
+
+    # build a temporary user vector from selfie(s)
+    user_vecs = []
+    for sf in selfie_files:
+        data = np.frombuffer(sf, dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        boxes, vs = detect_and_embed_faces(app, img)
+        for v in vs:
+            user_vecs.append(v)
+
+    if not user_vecs:
+        return {"album_id": album_id, "results": [], "error": "no face detected in selfie"}
+
+    # average user vector
+    u = np.mean(np.vstack(user_vecs), axis=0).astype(np.float32)
+    # cosine similarity vs all
+    # cos(a,b) = (a·b)/(|a||b|) → normalize embs and u
+    def l2n(x):
+        n = np.linalg.norm(x, axis=-1, keepdims=True) + 1e-9
+        return x / n
+    embs_n = l2n(embs)
+    u_n = u / (np.linalg.norm(u) + 1e-9)
+    sims = embs_n @ u_n  # (N,)
+
+    # pick top_k above threshold
+    idx = np.argsort(-sims)[:int(top_k)]
+    results = []
+    for i in idx:
+        s = float(sims[i])
+        if s < threshold:
+            continue
+        results.append({
+            "rel_path": meta[i]["rel_path"],
+            "score": s,
+            "box": meta[i].get("box"),
+        })
+
+    # group by image path -> take best score per image
+    best: Dict[str, Dict] = {}
+    for r in results:
+        rp = r["rel_path"]
+        if rp not in best or r["score"] > best[rp]["score"]:
+            best[rp] = r
+    results = sorted(best.values(), key=lambda x: -x["score"])
+
+    # write results.json (optional)
+    with open(p["results"], "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    return {"album_id": album_id, "count": len(results), "results": results}
+
+# ---------- Package matched images ----------
+
+def package_results_zip(album_id: str) -> bytes:
+    p = _paths(album_id)
+    root = p["album"]
+    results_path = p["results"]
+    results = []
+    if results_path.exists():
+        with open(results_path, "r", encoding="utf-8") as f:
+            results = json.load(f)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        for it in results:
+            ap = root / it["rel_path"]
+            if ap.exists():
+                z.write(ap, arcname=it["rel_path"])  # keep relative path inside zip
+    buf.seek(0)
+    return buf.read()
+```
+
+---
+
+# 2) Minimal changes to `face_service.py`
+
+Add **these helpers** at the bottom or near the top of `face_service.py` so `albums_service.py` can reuse them. (They are extracted from your existing logic.)
+
+```python
+# add to face_service.py
+from insightface.app import FaceAnalysis
+
+_app_singleton = None
+
+def build_insightface() -> FaceAnalysis:
+    global _app_singleton
+    if _app_singleton is None:
+        _app_singleton = FaceAnalysis(name='buffalo_l')
+        _app_singleton.prepare(ctx_id=0, det_size=(640,640))  # CPU ok; adjust if GPU later
+    return _app_singleton
+
+from pathlib import Path
+
+def image_paths_in_dir(root: Path):
+    root = Path(root)
+    exts = {'.jpg','.jpeg','.png','.bmp','.webp'}
+    return [p for p in root.rglob('*') if p.suffix.lower() in exts]
+
+def detect_and_embed_faces(app: FaceAnalysis, img_bgr) -> tuple[list, list]:
+    faces = app.get(img_bgr)
+    boxes = []
+    embs = []
+    for f in faces:
+        if getattr(f, 'embedding', None) is not None:
+            boxes.append(f.bbox.astype(float).tolist())
+            embs.append(f.embedding.astype('float32'))
+    return boxes, embs
+```
+
+> אם קיימים אצלך פונקציות דומות – השאר אותן, רק דאג שאלה יהיו זמינות ל־`albums_service`.
+
+---
+
+# 3) Update `main.py` to album‑scoped routes
+
+Replace the current global endpoints with album‑scoped ones (keep the old for now if אתה רוצה תאימות). Minimal example:
+
+```python
+# main.py (replace/add endpoints)
+from fastapi import FastAPI, UploadFile, File, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import os
+
+from .config import get_settings
+from .albums_service import (
+    extract_zip_to_album, index_album_images, index_progress,
+    search_in_album, package_results_zip
+)
+
+app = FastAPI(title="Face Finder API", version="0.3.0")
+sett = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=sett.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/api/albums/{album_id}/album")
+async def api_album_upload(album_id: str, zip: UploadFile = File(...)):
+    return extract_zip_to_album(album_id, zip.file)
+
+@app.post("/api/albums/{album_id}/index")
+async def api_album_index(album_id: str, overwrite: bool = True, resize_max: int = 2000):
+    return index_album_images(album_id, overwrite=overwrite, resize_max=resize_max)
+
+@app.get("/api/albums/{album_id}/index/progress")
+async def api_album_index_progress(album_id: str):
+    return index_progress(album_id)
+
+@app.post("/api/albums/{album_id}/search")
+async def api_album_search(
+    album_id: str,
+    selfies: list[UploadFile] = File(...),
+    threshold: float = Query(0.40),
+    top_k: int = Query(500),
+):
+    files = [await f.read() for f in selfies]
+    return search_in_album(album_id, files, threshold, top_k)
+
+@app.get("/api/albums/{album_id}/download")
+async def api_album_download(album_id: str):
+    z = package_results_zip(album_id)
+    return Response(z, media_type="application/zip", headers={
+        "Content-Disposition": "attachment; filename=matched_images.zip"
+    })
+```
+
+> אפשר להשאיר זמנית את `/api/selfies`, `/api/album`, `/api/index`, `/api/search` כדי לא לשבור את ה־UI הקיים; אבל המטרה היא לעבור למסלולי `/api/albums/{album_id}/...` בלבד.
+
+---
+
+# 4) Frontend (quick wiring)
+
+Until you split pages for photographer vs guest, add a **temporary album selector** and call the new endpoints. In `frontend/src/App.jsx`:
+
+* Add `const [albumId, setAlbumId] = useState('demo-wedding');`
+* Change upload/index/search URLs to `.../api/albums/${albumId}/...`
+* Keep your XHR progress for uploads.
+
+Minimal diff sketch:
+
+```jsx
+// at top
+const [albumId, setAlbumId] = useState('demo-wedding')
+
+// in UI header add:
+<div className="card">
+  <label className="mr-2">Album ID</label>
+  <input className="input" value={albumId} onChange={e=>setAlbumId(e.target.value)} />
+</div>
+
+// replace URLs
+xhrUpload({ url: `${API}/api/albums/${albumId}/album`, formData: fd, onProgress: setAlbumPct })
+fetch(`${API}/api/albums/${albumId}/index?overwrite=${overwrite}&resize_max=2000`, { method: 'POST' })
+xhrUpload({ url: `${API}/api/albums/${albumId}/search?threshold=${threshold}&top_k=${topk}`, formData: fd, onProgress: setSelfiePct })
+<a className="btn" href={`${API}/api/albums/${albumId}/download`}>הורד תוצאות (ZIP)</a>
+```
+
+Later, you’ll create two routes/pages:
+
+* **/p/** (photographer dashboard): upload ZIP, index, copy share link.
+* **/a/:albumId** (guest): selfie upload → results.
+
+---
+
+# 5) Notes on privacy & UX
+
+* We **don’t save guest selfies**—only embeddings in memory for that request.
+* Add a tiny notice on the guest page.
+* Consider a **result cap** (e.g., `top_k=300`) and a visual **thumbnail grid**.
+
+---
+
+# 6) Smoke test checklist
+
+1. Start API, visit `/docs` and try:
+
+   * `POST /api/albums/demo-wedding/album` → upload ZIP
+   * `POST /api/albums/demo-wedding/index?overwrite=true` → watch logs
+   * `GET  /api/albums/demo-wedding/index/progress` → percent grows to 100
+   * `POST /api/albums/demo-wedding/search` with 1 selfie → get results
+   * `GET  /api/albums/demo-wedding/download` → download zip
+2. Start frontend and test with `albumId = demo-wedding`.
+
+---
+
+# 7) Next small upgrades (after this patch)
+
+* ✅ Show thumbnails from results (expose a static file route for album images).
+* ✅ Bounding boxes overlay on thumbnails.
+* ✅ Persist index progress to a tiny file so it survives API restarts.
+* 🔜 Switch to FAISS for large albums.
+* 🔜 Photographer auth (JWT) + album CRUD; guest link is public slug.
+
+---
+
+If you want, I can paste exact App.jsx changes and a tiny `StaticFiles` mount to serve album images next. Let’s get this patch in first and run a smoke test.
