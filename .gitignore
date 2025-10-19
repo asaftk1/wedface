@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+*.sqlite3
+*.db
+backend/data/
+*.log
+
+# Node / Vite
+node_modules/
+dist/
+*.local
+*.env
+frontend/.vite/
+frontend/node_modules/
+frontend/dist/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Models / Large files
+*.onnx
+*.bin
+*.pt
+*.pth
+models/
