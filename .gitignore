@@ -11,6 +11,13 @@ venv/
 backend/data/
 *.log
 
+# data / DB / results
+backend/data/
+data/
+*.db
+*.sqlite3
+*.log
+
 # Node / Vite
 node_modules/
 dist/
@@ -20,6 +27,12 @@ frontend/.vite/
 frontend/node_modules/
 frontend/dist/
 
+# build / deps
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+
 # OS / IDE
 .DS_Store
 Thumbs.db
@@ -27,9 +40,14 @@ Thumbs.db
 .vscode/
 *.swp
 
-# Models / Large files
+# models & big binaries
+models/
 *.onnx
-*.bin
 *.pt
 *.pth
-models/
+*.bin
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
